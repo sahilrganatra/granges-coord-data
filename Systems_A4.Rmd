@@ -1,0 +1,325 @@
+---
+title: "Assignment 4"
+author: "Sahil Ganatra"
+date: "2025-03-23"
+output: html_document
+---
+
+```{r}
+if (!require('BiocManager', quietly = TRUE))
+    install.packages('BiocManager')
+
+BiocManager::install('GenomicFeatures')
+BiocManager::install("TxDb.Hsapiens.UCSC.hg19.knownGene")
+```
+
+```{r}
+library(tidyverse)                        # data manipulation and visualization
+library(rtracklayer)                      # importing genomic files
+library(GenomicRanges)                    # for handling genomic intervals
+library(GenomicFeatures)                  # for working with gene models
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)    # human genome annotations
+```
+
+```{r}
+# list of BigWig files from ATAC-seq experiment
+# the experiment compares 2 clones (Clone3 and Clone16) w/ and w/o IAA treatment
+# IAA treatment depletes CTCF protein through the auxin-inducible degron system
+bw_files <- c("GSM6072254_JWH213-C16MinusHudep-1963139.free.bw", # Clone16 control
+"GSM6072252_JWH211-C3MinusHudep-1963137.free.bw",       # Clone3 control
+"GSM6072255_JWH214-C16PlusHudep-1963140.free.bw",       # Clone16 IAA treated
+"GSM6072253_JWH212-C3PlusHudep-1963138.free.bw")        # Clone3 IAA treated
+
+# Import each BigWig file into a GRanges object
+gr_list <- lapply(bw_files, function(file) {
+import(file, format = "BigWig")
+})
+
+# Name each element in the list for easy reference
+names(gr_list) <- c("Clone16_Untreated", "Clone3_Untreated",
+"Clone16_IAA", "Clone3_IAA")
+
+# Display summary of the first dataset
+summary(gr_list[[1]])
+
+Clone16_Untreated <- length(gr_list[["Clone16_Untreated"]])
+Clone16_IAA <- length(gr_list[["Clone16_IAA"]])
+
+# print the counts
+cat("Clone 16 Untreated has: ", Clone16_Untreated, "ranges\n")
+cat("Clone 16 IAA has: ", Clone16_IAA, "ranges\n")
+
+counts <- c(Clone16_Untreated, Clone16_IAA)
+barplot(counts,
+        main ='Number of Ranges in Clone16 Conditions',
+        ylab = 'Number of Ranges',
+        col = c('lightblue', 'lightgreen'))
+```
+
+
+
+Questions: 
+
+1) What are the core components of a GRanges object? List them.
+
+GRanges is a vector of genomic locations and associate annotations. Each element
+in the vector consists of a sequence name, an interval, and a strand.
+
+2) Compare the number of ranges between Clone16_Untreated and Clone16_IAA.
+
+Clone16_Untreated has 1828285 ranges, and Clone16_IAA has 1549060 ranges. This
+indicates that IAA treatment results in fewer regions of open chormatin being
+detected.
+
+
+```{r}
+# Extracting Clone16 Untreated data for analysis
+gr1 <- gr_list[["Clone16_Untreated"]]
+
+# Demonstrating basic range operations
+# 1. Subset ranges on specific chromosomes
+chr1_ranges <- gr1[seqnames(gr1) == "chr1"]
+
+# 2. Find ranges within a specific genomic window
+region_of_interest <- GRanges("chr1", IRanges(1, 1000000)) # First 1Mb of chr1
+window_peaks <- subsetByOverlaps(gr1, region_of_interest)
+
+# 3. Calculate coverage
+peak_coverage <- coverage(gr1)
+
+# Calculate basic statistics
+chr1_stats <- data.frame(
+mean_score = mean(chr1_ranges$score),
+median_score = median(chr1_ranges$score),
+n_peaks = length(chr1_ranges)
+)
+```
+
+Questions (un-comment and fill in the code):
+```{r}
+# 1) Find all ranges on chromosome 2:
+chr2_ranges <- gr1[seqnames(gr1) == 'chr2']
+
+# 2) Calculate the median score:
+median_score <- median(chr2_ranges$score)
+```
+
+Part 3: Promoter Analysis
+```{r}
+# Load gene model database for human genome (hg19)
+txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+
+# Extract all gene coordinates
+genes <- genes(txdb)
+```
+```{r}
+# Define promoter regions (±2kb around transcription start sites)
+# The promoters() function automatically handles strand information
+promoter_regions <- promoters(genes, upstream = 2000, downstream = 2000)
+seqlevelsStyle(promoter_regions) <- seqlevelsStyle(gr_list[[1]])
+promoter_regions
+```
+```{r}
+# Demonstrate range arithmetic
+# reduce() merges overlapping ranges
+promoter_reduced <- reduce(promoter_regions)
+
+# disjoin() creates non-overlapping ranges
+promoter_disjoin <- disjoin(promoter_regions)
+
+# Find closest genes to peaks
+nearest_genes <- nearest(gr_list[[1]], promoter_regions)
+```
+
+Questions:
+
+1) Why do we use promoters() instead of just adding/subtracting from gene start
+   positions?
+
+The promoters() function automatically accounts for the strand information
+of each gene. Simply adding or subtracting a fixed number from the gene start
+positions would ignore that genes on the negative strand have their 
+transcription start sites oriented in the opposite direction.
+
+2) What does the seqlevelsStyle() function do and why is it necessary?
+
+The seqlevelsStyle() function allows us to get/set the naming convention for the
+sequence levels (chromosome names) in the GRanges objects. This is necessary 
+because different genomic resources may use different naming conventions.
+
+Part 4: Gene Annotation & Overlap Analysis
+```{r}
+# Load human gene annotation database
+library(org.Hs.eg.db)
+```
+```{r}
+# Extract Entrez gene IDs and map to gene symbols
+entrez_ids <- as.character(promoter_regions$gene_id)
+gene_symbols <- mapIds(org.Hs.eg.db,
+                       keys = entrez_ids,
+                       column = 'SYMBOL',       # get gene symbols
+                       keytype = 'ENTREZID',    # input ID type
+                       multiVals = 'first')     # take first mapping if multiple exist
+```
+```{r}
+# Add gene symbols to promoter regions
+promoter_regions$gene_symbol <- gene_symbols
+
+# Find overlaps between ATAC-seq peaks and promoter regions
+overlap_results <- lapply(gr_list, function(gr) {
+  overlaps <- findOverlaps(gr, promoter_regions)
+  gr[queryHits(overlaps)]
+})
+
+# Calculate overlap statistics
+overlap_stats <- lapply(overlap_results, function(gr) {
+  data.frame(
+    n_peaks = length(gr),
+    mean_score = mean(gr$score),
+    median_score = median(gr$score)
+  )
+})
+
+overlap_stats
+```
+
+Questions:
+
+1) What does findOverlaps() return?
+
+The findOverlaps() function compares 2 GRanges objects and returns indices of 
+intervals that overlap between them. It's used to determine which peaks from 
+gr1 fall within defined genomic regions.
+
+2) Uncomment and fill in the blanks in the code below to find only overlaps on
+   chromosome 1:
+```{r}
+chr1_overlaps <- findOverlaps(
+  gr_list[[1]][seqnames(gr_list[[1]]) == 'chr1'],
+  gr_list[[2]][seqnames(gr_list[[2]]) == 'chr1']
+)
+```
+
+Part 5: Differential Accessibility Analysis
+```{r}
+library(pheatmap)
+library(ggplot2)
+
+# Function to analyze differential accessibility
+analyze_diff_accessibility <- function(gr_list, promoter_regions, top_n = 20) {
+  # Option 1: Filter out promoter regions with missing gene symbols
+  promoter_regions <- promoter_regions[!is.na(promoter_regions$gene_symbol)]
+  
+  # Create accessibility matrix
+  promoter_matrix <- matrix(0,
+                            nrow = length(promoter_regions),
+                            ncol = length(gr_list))
+  
+  # Add names to matrix (make gene symbols unique and convert to character)
+  rownames(promoter_matrix) <- make.unique(as.character(promoter_regions$gene_symbol))
+  colnames(promoter_matrix) <- names(gr_list)
+  
+  # Fill in matrix with accessibility scores
+  for (i in seq_along(gr_list)) {
+    overlaps <- findOverlaps(gr_list[[i]], promoter_regions)
+    if (length(overlaps) > 0) {
+      # Sum scores for each promoter
+      scores <- split(gr_list[[i]]$score[queryHits(overlaps)],
+                      subjectHits(overlaps))
+      scores_sum <- sapply(scores, sum)
+      promoter_matrix[as.numeric(names(scores_sum)), i] <- scores_sum
+    }
+  }
+  
+  # Remove rows with all zeros or NA values
+  valid_rows <- rowSums(promoter_matrix) > 0 &
+    !apply(promoter_matrix, 1, function(x) any(is.na(x)))
+  promoter_matrix <- promoter_matrix[valid_rows, ]
+  
+  # Calculate fold changes
+  fold_changes <- data.frame(
+    gene_symbol = rownames(promoter_matrix),
+    Clone16_FC = log2((promoter_matrix[, 'Clone16_IAA'] + 1) /
+                      (promoter_matrix[, 'Clone16_Untreated'] + 1)),
+    Clone3_FC = log2((promoter_matrix[, 'Clone3_IAA'] + 1) / 
+                      (promoter_matrix[, 'Clone3_Untreated'] + 1))
+  )
+  
+  # Calculate average absolute fold change
+  fold_changes$avg_abs_FC <- (abs(fold_changes$Clone16_FC) +
+                              abs(fold_changes$Clone3_FC)) / 2
+  
+  # Select top differential promoters
+  top_genes <- fold_changes[order(fold_changes$Clone16_FC, decreasing = TRUE), 
+                            ][1:min(top_n, nrow(fold_changes)), ]
+  
+  # Create heatmap using as.character() to ensure correct subsetting
+  top_matrix <- promoter_matrix[as.character(top_genes$gene_symbol), ]
+  pheatmap(top_matrix,
+           main = 'Top Differentially Accessible Promoters',
+           color = colorRampPalette(c('white', 'navy', 'red'))(100),
+           cluster_rows = TRUE,
+           cluster_cols = TRUE,
+           fontsize_row = 9,
+           fontsize_col = 10)
+  
+  # Create scatter plot
+  scatter <- ggplot(fold_changes, aes(x = Clone3_FC, y = Clone16_FC)) + 
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = 'dashed', color = 'darkgray') +
+  geom_vline(xintercept = 0, linetype = 'dashed', color = 'darkgray') + 
+  geom_text(data = top_genes, aes(label = gene_symbol),
+            size = 3, hjust = -0.2, vjust = -0.2) +
+  labs(title = 'Comparison of IAA vs. Untreated Accessibility Changes',
+       x = 'Log2 Fold Change in Clone 3',
+       y = 'Log2 Fold Change in Clone 16') +
+  theme_minimal()
+
+  print(scatter)
+
+  return(list(fold_changes = fold_changes, top_genes = top_genes))
+}
+
+# Run differential accessibility analysis
+results <- analyze_diff_accessibility(gr_list, promoter_regions)
+results$top_genes %>% head()
+```
+
+
+Questions - Looking at the heatmap and scatter plot:
+
+1) What patterns do you observe in the differential accessibility between 
+   IAA and untreated conditions?
+
+The heatmap shows that many genes in both Clone3 and Clone16 become more 
+accessible when treated with IAA, but this is more prevalent with Clone16. The 
+scatter plot shows that most promoters cluster around (0, 0), indicating no 
+large difference bwtween IAA and untreated in either clone. However, there are 
+some promoters far from the origin in the upper-right quadrant, which is 
+consistent with the heatmap showig strong increases in accessibility for certain
+promoters upon IAA treatment.
+
+2) Why might we use both a heatmap and a scatter plot to visualize this data?
+
+While the scatterplot makes it easier to assess overall trends and to identify 
+outliers, the heatmap allows us to see clusters or patterns that might group 
+promoters with similar behavior. Together, these two visualizations offer both a
+broad overview and a more focused comparison of differential changes between 
+conditions.
+
+Part 6: Trying It Yourself
+```{r}
+ctcf_promoter <- promoter_regions[!is.na(promoter_regions$gene_symbol) 
+                                  & promoter_regions$gene_symbol == 'CTCF']
+ctcf_window <- resize(ctcf_promoter, width(ctcf_promoter) + 10000, fix='center')
+nearby_peaks <- gr1[queryHits(findOverlaps(gr1, ctcf_window))]
+
+# count the number of peaks within the extended CTCF promoter windows
+num_ctcf_peaks <- length(nearby_peaks)
+print(num_ctcf_peaks)
+```
+
+1) How many peaks fall within 5kb of CTCF promoters?
+
+Running the code above produced 244 peaks that fall within 5kb of CTCF 
+promoters.
